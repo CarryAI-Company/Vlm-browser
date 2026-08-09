@@ -18,7 +18,16 @@ android {
 
     signingConfigs {
         release {
-            storeFile file("/home/jetsonnano/chromeclone/chromeclone.keystore")
+            // Keystore lives next to app/build.gradle so the build works on any
+            // machine. It used to point at a hard-coded /home/jetsonnano path
+            // that only existed on the original dev box. The keystore is
+            // gitignored (*.keystore) — generate it once per checkout with:
+            //   keytool -genkeypair -keystore app/chromeclone.keystore \
+            //     -alias chromeclone -keyalg RSA -keysize 2048 -validity 10000 \
+            //     -storepass chromeclone123 -keypass chromeclone123 \
+            //     -dname "CN=ChromeClone, OU=CarryAI, O=CarryAI, L=HK, S=HK, C=HK"
+            // The password is dev-only and already lives in this file.
+            storeFile file("chromeclone.keystore")
             storePassword "chromeclone123"
             keyAlias "chromeclone"
             keyPassword "chromeclone123"

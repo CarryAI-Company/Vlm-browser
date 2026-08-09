@@ -355,6 +355,54 @@ public class MainActivity extends AppCompatActivity {
         view.evaluateJavascript(bridgeJs, null);
     }
 
+    /** True for IPv4/IPv6 literal hosts (e.g. 127.0.0.1) — they get no wildcard rules. */
+    private static boolean isIpLiteral(String host) {
+        // IPv6 literals contain colons; IPv4 literals are all digits and dots.
+        if (host.indexOf(':') >= 0) return true;
+        for (int i = 0; i < host.length(); i++) {
+            char c = host.charAt(i);
+            if (c != '.' && (c < '0' || c > '9')) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Builds the allowedOriginRules set for WebViewCompat.addDocumentStartJavaScript.
+     *
+     * CRITICAL: the rules must be bare ORIGINS (scheme://host, e.g.
+     * "https://localhost" or "https://*.carryai.co") — the API throws
+     * IllegalArgumentException for any rule containing a path ("https://localhost/*"),
+     * and because the whole call fails atomically, one bad rule silently disables
+     * document-start injection entirely (the page then only gets the slower
+     * onPageStarted/onPageFinished fallback, which runs AFTER page scripts and
+     * breaks parse-time feature detection like the PCF demo's).
+     *
+     * Extracted as a static method so unit tests can guard the rule format.
+     */
+    static Set<String> buildDocumentStartRules() {
+        Set<String> rules = new HashSet<>();
+        // NOTE: the bundled file:///android_asset/ test page is deliberately NOT
+        // covered here — the API only accepts bare origins (scheme://host) for
+        // http(s) schemes, and file: URLs have no host, so any file: rule is
+        // invalid and would break the whole registration. file: pages rely on
+        // the evaluateJavascript fallback in injectBridge() (verified working).
+        for (String host : ALLOWED_BRIDGE_HOSTS) {
+            if (host.isEmpty()) continue;
+            // Bare origins ONLY — never append "/*" or any path component.
+            rules.add("https://" + host);
+            rules.add("http://" + host);
+            if (host.indexOf('.') > 0 && !isIpLiteral(host)) {
+                // Subdomain origins for real domains only, e.g.
+                // https://*.carryai.co for 2026-pcf-demo.carryai.co
+                // (still no path component). IP literals like 127.0.0.1 get
+                // no wildcard rules — "https://*.127.0.0.1" is meaningless.
+                rules.add("https://*." + host);
+                rules.add("http://*." + host);
+            }
+        }
+        return rules;
+    }
+
     /**
      * Registers the bridge shim as a document-start script so it executes before
      * any page script. Origin rules restrict it to the allowed hosts (plus the
@@ -368,21 +416,8 @@ public class MainActivity extends AppCompatActivity {
             if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                 return;
             }
-            Set<String> rules = new HashSet<>();
-            // Bundled test page.
-            rules.add("file:///android_asset/*");
-            // Allowed bridge hosts, plus their subdomains.
-            for (String host : ALLOWED_BRIDGE_HOSTS) {
-                if (host.isEmpty()) continue;
-                rules.add("https://" + host + "/*");
-                rules.add("http://" + host + "/*");
-                if (host.indexOf('.') > 0) {
-                    // e.g. https://*.carryai.co/* for 2026-pcf-demo.carryai.co
-                    rules.add("https://*." + host + "/*");
-                    rules.add("http://*." + host + "/*");
-                }
-            }
-            WebViewCompat.addDocumentStartJavaScript(webView, bridgeJs, rules);
+            WebViewCompat.addDocumentStartJavaScript(webView, bridgeJs,
+                    buildDocumentStartRules());
         } catch (Throwable t) {
             // If document-start injection is unavailable, fall back to the
             // evaluateJavascript path in injectBridge() — no fatal error here.
