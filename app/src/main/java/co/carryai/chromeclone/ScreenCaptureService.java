@@ -159,6 +159,30 @@ public class ScreenCaptureService extends Service {
     /** Second startup pass: still no first frame => request a full restart. */
     private static final long STARTUP_RESTART_MS = 9000L;
 
+    // --------------------------------------------------------------
+    // JS <-> Native heartbeat ("dead bridge" detection).
+    //
+    // The mid-session ladder above watches the NATIVE capture pipeline
+    // (ImageReader). But a second failure mode exists that it can never see:
+    // the WebView RENDERER is a separate process and Android may kill it in
+    // the background (especially on low-RAM real devices). When that happens
+    // native keeps capturing + pushing frames, but evaluateJavascript fails
+    // silently — the canvas never updates and the page stays black even
+    // though "capture alive" logs keep scrolling. The JS side acks every 25th
+    // received frame via ChromeCloneNative.ackFrame(); if native pushes
+    // frames while visible but no ack arrives for a while, the renderer is
+    // dead and the Activity reloads the page + offers one-tap re-engage.
+    // --------------------------------------------------------------
+    /** Last time the JS side acked a received frame (heartbeat). */
+    private volatile long lastJsAckAt = 0L;
+    /** Frames pushed since the last JS ack. */
+    private volatile long framesSinceAck = 0L;
+    /** When the last dead-renderer detection ran (rate-limit re-detection). */
+    private volatile long lastDeadDetectAt = 0L;
+    /** Pushed-but-unacked frame budget before declaring the renderer dead. */
+    private static final long DEAD_BRIDGE_FRAME_BUDGET = 40L; // ~4s at 10fps
+    private static final long DEAD_DETECT_GAP_MS = 8000L;
+
     private int width;
     private int height;
     private int densityDpi;
@@ -275,6 +299,35 @@ public class ScreenCaptureService extends Service {
                         android.util.Log.i("ScreenCaptureService",
                                 "Watchdog: stalled, full restart already in flight");
                         break;
+                }
+            }
+
+            // ------------------------------------------------------------
+            // Dead-bridge detection (orthogonal to the capture ladder above):
+            // native IS pushing frames (capture looks healthy, lastFrameAt is
+            // fresh) but the JS side has not acked anything for
+            // DEAD_BRIDGE_FRAME_BUDGET frames. That means evaluateJavascript
+            // is silently failing — the WebView renderer was killed/frozen in
+            // the background while the app process itself survived (the
+            // renderer is a separate process the keep-alive service cannot
+            // protect). Symptom on device: "recovering" shows but the preview
+            // stays black. Recovery: the Activity reloads the page; capture
+            // keeps running so one Share Screen tap re-attaches.
+            // ------------------------------------------------------------
+            if (firstFrameSeen && activityVisible
+                    && framesSinceAck >= DEAD_BRIDGE_FRAME_BUDGET
+                    && now - lastDeadDetectAt > DEAD_DETECT_GAP_MS) {
+                lastDeadDetectAt = now;
+                framesSinceAck = 0; // Fresh budget for the reloaded page.
+                android.util.Log.w("ScreenCaptureService",
+                        "Dead bridge detected: pushed frames with no JS ack for a while"
+                                + " (renderer killed/frozen) — asking Activity to reload");
+                showToast("Screen share lost — reloading…");
+                DeadBridgeHandler dbh = deadBridgeHandler;
+                if (dbh != null) {
+                    mainHandler.post(() -> {
+                        try { dbh.onDeadBridgeDetected(); } catch (Throwable ignored) {}
+                    });
                 }
             }
             captureHandler.postDelayed(this, WATCHDOG_INTERVAL_MS);
@@ -867,7 +920,35 @@ public class ScreenCaptureService extends Service {
     private void pushFrameToJs(String dataUrl) {
         // Escape single quotes defensively (base64 never contains them, but be safe).
         String js = "window.__onScreenFrame && window.__onScreenFrame('" + dataUrl + "');";
+        // Heartbeat bookkeeping: every frame we PUSH must eventually be acked
+        // by JS. A growing unacked count while visible means the renderer /
+        // bridge is dead even though capture looks healthy.
+        framesSinceAck++;
         notifyJs(js);
+    }
+
+    /**
+     * Heartbeat ack from the JS side (bridge.js calls ChromeCloneNative.ackFrame
+     * for every 25th frame it actually receives). Resets the dead-bridge
+     * counters. Called on the JavaBridge thread — only touches volatiles.
+     */
+    public void ackFrame() {
+        lastJsAckAt = System.currentTimeMillis();
+        framesSinceAck = 0;
+    }
+
+    /**
+     * Set by MainActivity: invoked when the heartbeat shows native is pushing
+     * frames but the JS side is receiving none (dead renderer / frozen
+     * bridge). Called on the main thread.
+     */
+    public interface DeadBridgeHandler {
+        void onDeadBridgeDetected();
+    }
+    private volatile DeadBridgeHandler deadBridgeHandler;
+
+    public void setDeadBridgeHandler(DeadBridgeHandler handler) {
+        deadBridgeHandler = handler;
     }
 
     private void notifyJs(String js) {

@@ -361,6 +361,9 @@ public class MainActivity extends AppCompatActivity {
         if (svc != null) {
             svc.setRestartHandler(restartHandler);
         }
+        if (svc != null) {
+            svc.setDeadBridgeHandler(deadBridgeHandler);
+        }
     }
 
     /**
@@ -382,6 +385,32 @@ public class MainActivity extends AppCompatActivity {
             }
             restartInFlight = true;
             startActivityForResult(mpm.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION_RESTART);
+        });
+    };
+
+    /**
+     * Invoked when the heartbeat shows native is pushing frames but the JS
+     * side receives none — the WebView renderer was killed or frozen in the
+     * background while the app process survived. evaluateJavascript is
+     * silently failing, so the canvas stays black even though capture looks
+     * healthy. The only fix is to reload the page, which restarts the
+     * renderer. The capture service keeps running across the reload, so once
+     * the page re-injects bridge.js the frames resume automatically. Runs on
+     * the main thread.
+     */
+    private final ScreenCaptureService.DeadBridgeHandler deadBridgeHandler = () -> {
+        runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            if (webView == null) return;
+            android.util.Log.w("ChromeClone",
+                    "dead bridge — reloading page to revive the renderer");
+            progressBar.setVisibility(View.VISIBLE);
+            String url = currentPageUrl;
+            if (url == null || url.isEmpty()) url = webView.getUrl();
+            if (url == null || url.isEmpty()) url = HOME_URL;
+            webView.loadUrl(url);
+            // After reload the service's frames flow into the fresh page; the
+            // JS shim re-acks and the detector re-arms naturally.
         });
     };
 
@@ -909,6 +938,17 @@ public class MainActivity extends AppCompatActivity {
                 cameraActive = active;
                 updateKeepAlive();
             });
+        }
+
+        /**
+         * Heartbeat ack from bridge.js (every 25th frame received). Resets
+         * the dead-bridge detector. No origin gate needed — an ack is harmless
+         * telemetry; but keep the gate for consistency.
+         */
+        @JavascriptInterface
+        public void ackFrame() {
+            ScreenCaptureService svc = ScreenCaptureService.getInstance();
+            if (svc != null) svc.ackFrame();
         }
 
         @JavascriptInterface

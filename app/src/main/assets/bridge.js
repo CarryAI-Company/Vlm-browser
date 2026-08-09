@@ -407,6 +407,19 @@
             console.warn('[ChromeClone] __onScreenFrame image decode error');
         };
         img.src = dataUrl;
+        // Heartbeat ack: tells native the JS side is actually consuming
+        // frames. If native keeps pushing but these acks stop arriving, the
+        // renderer/bridge is dead (a background kill that evaluateJavascript
+        // cannot see) and native reloads the page + auto-restarts capture.
+        // Throttled to once every 25 frames (~2.5s at 10fps) to keep the
+        // JavaBridge chatter negligible.
+        if (screenState.framesReceived % 25 === 1) {
+            try {
+                if (window.ChromeCloneNative && window.ChromeCloneNative.ackFrame) {
+                    window.ChromeCloneNative.ackFrame();
+                }
+            } catch (e) { /* acks are best-effort diagnostics */ }
+        }
         if (screenState.pendingResolve) {
             var resolve = screenState.pendingResolve;
             screenState.pendingResolve = null;
