@@ -25,3 +25,4 @@ chromium-src/
 
 # Emulator test artifacts
 *.png
+test_emulator.sh
