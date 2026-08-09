@@ -133,6 +133,7 @@ public class ScreenCaptureService extends Service {
     public void setRestartHandler(RestartHandler handler) {
         restartHandler = handler;
     }
+
     /**
      * True while the Activity is in the foreground. The watchdog only fires
      * when visible: in the background the system legitimately pauses the
@@ -140,6 +141,24 @@ public class ScreenCaptureService extends Service {
      * there just wastes recovery attempts and eats the rate-limit window.
      */
     private volatile boolean activityVisible = false;
+    /**
+     * When the current capture session started (System.currentTimeMillis).
+     * Used by the startup-stall detector: a VirtualDisplay that never pumps
+     * its first frame within the budget is dead on arrival and cannot be
+     * fixed by the mid-session ladder (which is gated on firstFrameSeen).
+     */
+    private volatile long captureStartedAt = 0L;
+    /** True once the startup-stall detector has tried its surface-swap kick. */
+    private volatile boolean startupSwapTried = false;
+    /**
+     * Startup-stall budget: on healthy devices the first frame arrives within
+     * ~300ms-1.5s. Past this with zero frames the display is considered dead
+     * on arrival and recovery starts (surface-swap kick, then full restart).
+     */
+    private static final long STARTUP_FIRST_FRAME_MS = 5000L;
+    /** Second startup pass: still no first frame => request a full restart. */
+    private static final long STARTUP_RESTART_MS = 9000L;
+
     private int width;
     private int height;
     private int densityDpi;
@@ -169,6 +188,44 @@ public class ScreenCaptureService extends Service {
         public void run() {
             if (!capturing) return;
             long now = System.currentTimeMillis();
+
+            // ------------------------------------------------------------
+            // Startup-stall path: the VirtualDisplay NEVER produced its first
+            // frame. The mid-session ladder below is gated on firstFrameSeen,
+            // so without this branch a dead-on-arrival display would sit black
+            // forever with zero recovery (the exact "recovering but only ever
+            // black from the start" report). A display that never pumps cannot
+            // be fixed by a surface-swap alone, so we give one cheap surface-
+            // swap kick (some devices need the re-mirror nudge), then go
+            // straight to a full restart (fresh MediaProjection session).
+            // ------------------------------------------------------------
+            if (!firstFrameSeen) {
+                long sinceStart = now - captureStartedAt;
+                if (activityVisible && now - lastRecoverAt > RECOVER_MIN_GAP_MS) {
+                    if (!startupSwapTried && sinceStart >= STARTUP_FIRST_FRAME_MS) {
+                        startupSwapTried = true;
+                        lastRecoverAt = now;
+                        android.util.Log.w("ScreenCaptureService",
+                                "Startup stall: no first frame after " + sinceStart
+                                        + "ms, attempting surface-swap kick");
+                        showToast("Screen capture stalled — recovering…");
+                        recoverCapture();
+                    } else if (startupSwapTried && sinceStart >= STARTUP_RESTART_MS) {
+                        lastRecoverAt = now;
+                        android.util.Log.w("ScreenCaptureService",
+                                "Startup stall: still no first frame after " + sinceStart
+                                        + "ms, requesting full capture restart");
+                        showToast("Screen capture stalled — restarting…");
+                        requestFullRestart();
+                        // requestFullRestart tears down + restarts; the fresh
+                        // session resets captureStartedAt/startupSwapTried in
+                        // startCaptureInternal, so the detector re-arms.
+                    }
+                }
+                captureHandler.postDelayed(this, WATCHDOG_INTERVAL_MS);
+                return;
+            }
+
             if (firstFrameSeen && activityVisible
                     && now - lastFrameAt > STALL_THRESHOLD_MS
                     && now - lastRecoverAt > RECOVER_MIN_GAP_MS) {
@@ -750,9 +807,12 @@ public class ScreenCaptureService extends Service {
         capturing = true;
         firstFrameSeen = false;
         // Fresh session: reset the recovery ladder and the restart counter so
-        // this capture gets the full escalation budget again.
+        // this capture gets the full escalation budget again, and arm the
+        // startup-stall detector from this moment.
         recoveryLevel = 0;
         restartCount = 0;
+        startupSwapTried = false;
+        captureStartedAt = System.currentTimeMillis();
         notifyJs("window.__onScreenStarted && window.__onScreenStarted();");
         // Start the stall watchdog (fires every 2s; recovers after 3s of no frames).
         captureHandler.removeCallbacks(captureWatchdog);
@@ -855,6 +915,11 @@ public class ScreenCaptureService extends Service {
      * __onScreenEnded. That signal makes the JS shim stop the stream tracks —
      * fatal for a restart, which needs the page's canvas/captureStream to
      * stay alive so the fresh session's frames revive the same preview.
+     *
+     * Ordering note: the teardown body and the follow-up restart prompt are
+     * both posted to the same main handler in FIFO order, so by the time the
+     * consent prompt appears the old MediaProjection/VirtualDisplay are fully
+     * released (Android 14+ allows only ONE active MediaProjection per app).
      */
     private void stopCaptureSilently() {
         stopCaptureInternal(false);
