@@ -82,3 +82,21 @@ dependencies {
     androidTestImplementation 'androidx.test:runner:1.6.2'
     androidTestImplementation 'androidx.test:rules:1.6.1'
 }
+
+// Convenience: also drop the signed release APK at the repo root (gitignored)
+// so install paths stay short and stable across machines. Plain doLast (not a
+// Copy task) so Gradle doesn't treat the root project dir as a declared output
+// and clash with lint's implicit project-dir dependency.
+tasks.register('copyReleaseApk') {
+    dependsOn 'assembleRelease'
+    doLast {
+        def src = layout.buildDirectory.file('outputs/apk/release/app-release.apk').get().asFile
+        def dst = new File(rootProject.projectDir, 'app-release.apk')
+        java.nio.file.Files.copy(src.toPath(), dst.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        logger.lifecycle("Copied ${src} -> ${dst}")
+    }
+}
+tasks.matching { it.name == 'assembleRelease' }.configureEach {
+    finalizedBy 'copyReleaseApk'
+}

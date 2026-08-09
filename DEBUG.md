@@ -63,12 +63,32 @@ virtualDisplay.surface = imageReader.surface
 ```
 (ScreenStream `BitmapCapture.kt`, Google issue 370625489.)
 
-## Emulator testing (NOT viable on this host)
+## Emulator testing
 
-This dev VM (Proxmox LXC, x86_64, no /dev/kvm) cannot run the Android emulator
-in reasonable time (software boot ~30min, SystemUI ANR). redroid fails with
-`pivot_root: permission denied` (container runtime restriction). Real-device
-adb testing is the reliable path.
+**Proxmox LXC dev VM (x86_64, no /dev/kvm): NOT viable** — software boot ~30min,
+SystemUI ANR; redroid fails with `pivot_root: permission denied`.
+
+**Apple Silicon (M4 Max) host: fully viable** — `emulator -avd <avd> -no-window`
+boots in seconds via hypervisor.framework. Test flow used (API 35, Google APIs arm64):
+install release APK, open app, tap Test page, tap Share Screen, grant prompt
+(Android 15 adds an app-selector step — pick "Entire screen", not "A single app",
+or the grant returns CANCELED), then watch `First frame captured` and
+`capture alive: N frames pushed`. Note: a STATIC screen legitimately stops
+pumping frames (AUTO_MIRROR only mirrors content changes) — wiggle the UI
+(`input swipe`) before judging a stall.
+
+## 2026-08-09 emulator verification results (API 35)
+
+- Latest build (requestFrame no longer recovers): **OK** — First frame within ~1s,
+  no black-from-start.
+- App switches x3 (HOME away / back): no black screen; requestFrame pumps a frame
+  on resume and capture continues once the display moves.
+- 30s screen-off: watchdog fired once (benign), recovered on resume.
+- MediaProjection never revoked (no `onStop fired`).
+- FIXED (commit 209080b): document-start bridge injection was dead —
+  `allowedOriginRules https://localhost/* is invalid`. Rules are now bare origins
+  (see DocumentStartRulesTest). Also: keystore path no longer hard-coded.
+- 48 unit tests green, lint clean.
 
 ## Files
 

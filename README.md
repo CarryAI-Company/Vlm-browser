@@ -15,7 +15,7 @@ Default home page: `https://2026-pcf-demo.carryai.co/live-caption`
 ./gradlew assembleRelease testReleaseUnitTest lintRelease
 ```
 
-43 unit tests, lint clean, APK signed with v2.
+48 unit tests, lint clean, APK signed with v2.
 
 APK: `app/build/outputs/apk/release/app-release.apk` (also copied to `./app-release.apk`).
 
