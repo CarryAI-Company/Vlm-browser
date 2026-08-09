@@ -207,6 +207,43 @@ public class ScreenCaptureService extends Service {
     /** True while the native upload path is active (frames bypass the JS bridge). */
     private volatile boolean uploadMode = false;
 
+    /**
+     * Most recent FULL-frame JPEG (no crop applied), kept for the crop-picker
+     * UI to display. Written on the capture thread, read by the picker.
+     */
+    private volatile byte[] latestFullJpeg;
+    /** One-shot flag: grab the next full frame for the crop picker. */
+    private volatile boolean snapshotRequested = false;
+
+    /** Asks the capture pipeline to snapshot the next full frame (uncropped). */
+    public void requestFullSnapshot() {
+        latestFullJpeg = null;
+        snapshotRequested = true;
+    }
+
+    /** Returns the latest full-frame snapshot JPEG, or null if none yet. */
+    public byte[] takeFullSnapshot() {
+        byte[] j = latestFullJpeg;
+        latestFullJpeg = null;
+        return j;
+    }
+
+    /** Encodes a full-frame JPEG (used for the crop-picker snapshot). */
+    private byte[] fullFrameJpeg(Bitmap full, int w, int h) {
+        int maxDim = Math.max(w, h);
+        Bitmap bmp = full;
+        if (maxDim > MAX_FRAME_DIM) {
+            float scale = (float) MAX_FRAME_DIM / (float) maxDim;
+            bmp = Bitmap.createScaledBitmap(full,
+                    Math.max(1, Math.round(w * scale)),
+                    Math.max(1, Math.round(h * scale)), true);
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
+        bmp.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY + 10, out);
+        if (bmp != full) bmp.recycle();
+        return out.toByteArray();
+    }
+
     public static ScreenCaptureService getInstance() {
         return sInstance.get();
     }
@@ -895,6 +932,13 @@ public class ScreenCaptureService extends Service {
         buffer.rewind();
         reusableBitmap.copyPixelsFromBuffer(buffer);
         full = Bitmap.createBitmap(reusableBitmap, 0, 0, w, h);
+
+        // One-shot full-frame snapshot for the crop-picker UI: only when
+        // explicitly requested (snapshotRequested), so capture stays cheap.
+        if (snapshotRequested) {
+            snapshotRequested = false;
+            latestFullJpeg = fullFrameJpeg(full, w, h);
+        }
 
         // Optional crop: cut out the selected region (fractions of the frame)
         // BEFORE downscaling, so the VLM only ever sees the region of interest.

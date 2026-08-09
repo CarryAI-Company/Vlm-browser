@@ -75,6 +75,12 @@ dependencies {
     implementation 'androidx.webkit:webkit:1.12.1'
     // WebSocket client for the native frame uploader (/ws/inference).
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    // CameraX — native camera capture source (Phase 2).
+    def camerax_version = "1.3.4"
+    implementation "androidx.camera:camera-camera2:${camerax_version}"
+    implementation "androidx.camera:camera-lifecycle:${camerax_version}"
+    implementation "androidx.lifecycle:lifecycle-common:2.8.3"
+    implementation "androidx.lifecycle:lifecycle-runtime:2.8.3"
 
     testImplementation 'junit:junit:4.13.2'
     // Real org.json for JVM unit tests (the Android stub throws "not mocked").

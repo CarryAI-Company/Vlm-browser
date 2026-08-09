@@ -510,13 +510,59 @@ public class MainActivity extends AppCompatActivity {
             toggleBookmarkCurrentPage();
             return true;
         });
-        btnSwitchCamera.setOnClickListener(v -> switchCameraFromUi());
+        btnSwitchCamera.setOnClickListener(v -> showCameraChooser());
         // Long-press Switch Camera = capture/upload settings (Phase 2).
         btnSwitchCamera.setOnLongClickListener(v -> {
             showCaptureSettingsDialog();
             return true;
         });
         updateNavButtons();
+    }
+
+    /**
+     * Camera source chooser (Phase 2): pick between the page's own camera
+     * (WebView getUserMedia) and the NATIVE camera capture source, which
+     * uploads frames straight to the VLM service without any WebView
+     * involvement.
+     */
+    private void showCameraChooser() {
+        CameraCaptureService cam = CameraCaptureService.getInstance();
+        boolean nativeActive = cam != null && cam.isCapturing();
+        String[] items = {
+                "Switch page camera (front/back)",
+                nativeActive ? "Switch native camera lens" : "Start NATIVE camera capture (AI upload)",
+                "Stop native camera capture"
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("Camera source")
+                .setItems(items, (d, which) -> {
+                    if (which == 0) {
+                        switchCameraFromUi();
+                    } else if (which == 1) {
+                        if (nativeActive) {
+                            Intent sw = new Intent(this, CameraCaptureService.class);
+                            sw.setAction(CameraCaptureService.ACTION_SWITCH);
+                            startService(sw);
+                            Toast.makeText(this, "Switching camera lens…",
+                                    Toast.LENGTH_SHORT).show();
+                        } else {
+                            toggleNativeCamera();
+                        }
+                    } else if (which == 2) {
+                        if (nativeActive) {
+                            Intent stop = new Intent(this, CameraCaptureService.class);
+                            stop.setAction(CameraCaptureService.ACTION_STOP);
+                            startService(stop);
+                            Toast.makeText(this, "Camera capture stopped",
+                                    Toast.LENGTH_SHORT).show();
+                        } else {
+                            Toast.makeText(this, "Native camera not running",
+                                    Toast.LENGTH_SHORT).show();
+                        }
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     /**
@@ -840,6 +886,73 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ------------------------------------------------------------------
+    // Native camera capture source (Phase 2)
+    // ------------------------------------------------------------------
+
+    /**
+     * Starts (or stops) the native camera capture source: CameraX frames go
+     * straight to the VLM service via the shared FrameUploader — no WebView
+     * involvement, so it works even when the page/renderer is backgrounded.
+     * Mutually exclusive with screen capture.
+     */
+    private void toggleNativeCamera() {
+        CameraCaptureService cam = CameraCaptureService.getInstance();
+        if (cam != null && cam.isCapturing()) {
+            Intent stop = new Intent(this, CameraCaptureService.class);
+            stop.setAction(CameraCaptureService.ACTION_STOP);
+            startService(stop);
+            Toast.makeText(this, "Camera capture stopped", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        // Screen capture and camera capture are mutually exclusive sources.
+        ScreenCaptureService screen = ScreenCaptureService.getInstance();
+        if (screen != null && screen.isCapturing()) {
+            Intent stop = new Intent(this, ScreenCaptureService.class);
+            stop.setAction(ScreenCaptureService.ACTION_STOP);
+            startService(stop);
+        }
+        Intent start = new Intent(this, CameraCaptureService.class);
+        start.setAction(CameraCaptureService.ACTION_START);
+        start.putExtra(CameraCaptureService.EXTRA_LENS,
+                androidx.camera.core.CameraSelector.LENS_FACING_BACK);
+        ContextCompat.startForegroundService(this, start);
+        // Wire settings + caption relay after the service exists.
+        webView.postDelayed(() -> {
+            CameraCaptureService svc = CameraCaptureService.getInstance();
+            if (svc != null) {
+                svc.setCaptionSink((text, sid) -> runOnUiThread(() -> {
+                    if (webView != null) {
+                        webView.evaluateJavascript(
+                                "window.__onCaption && window.__onCaption("
+                                        + jsEscape(text) + "," + jsEscape(sid) + ");",
+                                null);
+                    }
+                }));
+                svc.setUploadMode(true, config()); // camera source = upload mode
+            }
+        }, 400);
+        Toast.makeText(this, "Camera capture started (native upload)",
+                Toast.LENGTH_SHORT).show();
+    }
+
+    /** JS-escapes a value into a quoted string literal for evaluateJavascript. */
+    private static String jsEscape(String s) {
+        if (s == null) return "''";
+        StringBuilder sb = new StringBuilder("'");
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\': sb.append("\\\\"); break;
+                case '\'': sb.append("\\'"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                default: sb.append(c);
+            }
+        }
+        return sb.append("'").toString();
+    }
+
+    // ------------------------------------------------------------------
     // Phase 2: native upload mode + settings
     // ------------------------------------------------------------------
 
@@ -908,21 +1021,67 @@ public class MainActivity extends AppCompatActivity {
                             ? "Upload ON → " + cfg.getServerUrl()
                             : "Upload OFF (legacy JS bridge)", Toast.LENGTH_SHORT).show();
                 })
-                .setNeutralButton(cfg.hasCrop() ? "Clear crop" : "No crop set", (d, w) -> {
-                    if (cfg.hasCrop()) {
-                        cfg.clearCrop();
-                        Toast.makeText(this, "Crop cleared", Toast.LENGTH_SHORT).show();
-                        ScreenCaptureService svc = ScreenCaptureService.getInstance();
-                        if (svc != null) applyUploadMode(svc);
-                    }
+                .setNeutralButton("Crop region…", (d, w) -> {
+                    openCropPicker();
                 })
                 .setNegativeButton("Cancel", null)
                 .show();
     }
 
+    /** Request code for the crop-picker result. */
+    private static final int REQ_CROP_PICKER = 1004;
+
+    /**
+     * Opens the visual crop picker with a fresh full-frame snapshot from the
+     * running capture. Needs an active capture (Share Screen) to snapshot.
+     */
+    private void openCropPicker() {
+        ScreenCaptureService svc = ScreenCaptureService.getInstance();
+        if (svc == null || !svc.isCapturing()) {
+            Toast.makeText(this,
+                    "Start Share Screen first, then set the crop region",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        svc.requestFullSnapshot();
+        // Wait a moment for the capture thread to fill the snapshot, then read it.
+        webView.postDelayed(() -> {
+            byte[] jpeg = svc.takeFullSnapshot();
+            if (jpeg == null || jpeg.length == 0) {
+                // Retry once — the next frame will be snapshotted.
+                svc.requestFullSnapshot();
+                webView.postDelayed(() -> {
+                    byte[] j2 = svc.takeFullSnapshot();
+                    launchCropPicker(j2);
+                }, 300);
+            } else {
+                launchCropPicker(jpeg);
+            }
+        }, 300);
+    }
+
+    private void launchCropPicker(byte[] jpeg) {
+        if (jpeg == null || jpeg.length == 0) {
+            Toast.makeText(this, "Could not capture a frame for cropping",
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Intent i = new Intent(this, CropPickerActivity.class);
+        i.putExtra(CropPickerActivity.EXTRA_JPEG, jpeg);
+        startActivityForResult(i, REQ_CROP_PICKER);
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_CROP_PICKER) {
+            // Crop (possibly) changed — reapply to a running capture.
+            if (resultCode == Activity.RESULT_OK) {
+                ScreenCaptureService svc = ScreenCaptureService.getInstance();
+                if (svc != null) applyUploadMode(svc);
+            }
+            return;
+        }
         if (requestCode == REQ_MEDIA_PROJECTION || requestCode == REQ_MEDIA_PROJECTION_RESTART) {
             boolean isRestart = requestCode == REQ_MEDIA_PROJECTION_RESTART;
             restartInFlight = false;
