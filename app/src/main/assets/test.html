@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>ChromeClone Test Page</title>
+<style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0; padding: 16px;
+        background: #1f1f1f; color: #e8e8e8;
+        font-family: -apple-system, Roboto, "Segoe UI", sans-serif;
+    }
+    h1 { font-size: 20px; color: #4d8dff; margin: 0 0 4px; }
+    h2 { font-size: 14px; color: #9a9a9a; font-weight: normal; margin: 0 0 16px; }
+    .grid { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    button {
+        background: #2b2b2b; color: #e8e8e8;
+        border: 1px solid #4a4a4a; border-radius: 8px;
+        padding: 12px 16px; font-size: 14px; cursor: pointer;
+    }
+    button:active { background: #4d8dff; color: #fff; }
+    button.primary { background: #4d8dff; color: #fff; border-color: #4d8dff; }
+    video {
+        width: 100%; max-height: 320px; background: #000;
+        border-radius: 8px; border: 1px solid #3a3a3a; margin: 8px 0;
+    }
+    #log {
+        background: #141414; border: 1px solid #3a3a3a; border-radius: 8px;
+        padding: 10px; font-family: monospace; font-size: 11px;
+        height: 260px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+    }
+    .ok { color: #34a853; } .err { color: #ea4335; } .info { color: #fbbc05; }
+    .badge {
+        display: inline-block; padding: 2px 8px; border-radius: 10px;
+        font-size: 11px; background: #2b2b2b; border: 1px solid #4a4a4a; margin-right: 6px;
+    }
+</style>
+</head>
+<body>
+<h1>ChromeClone QA Test Page</h1>
+<h2>getUserMedia / camera switching / bridged getDisplayMedia verification</h2>
+
+<div>
+    <span class="badge" id="badgeBridge">bridge: ?</span>
+    <span class="badge" id="badgeGUM">getUserMedia: ?</span>
+    <span class="badge" id="badgeGDM">getDisplayMedia: ?</span>
+</div>
+
+<div class="grid">
+    <button class="primary" id="btnCamera">Test Camera</button>
+    <button id="btnSwitch">Switch Camera</button>
+    <button id="btnEnum">Enumerate Devices</button>
+    <button class="primary" id="btnShare">Share Screen</button>
+    <button id="btnStop">Stop All</button>
+</div>
+
+<video id="preview" autoplay playsinline muted></video>
+<div id="log"></div>
+
+<script>
+'use strict';
+var logEl = document.getElementById('log');
+var preview = document.getElementById('preview');
+var currentStream = null;
+var videoDevices = [];
+var currentDeviceIndex = -1;
+
+function log(msg, cls) {
+    var ts = new Date().toISOString().substr(11, 8);
+    var line = document.createElement('div');
+    line.className = cls || '';
+    line.textContent = '[' + ts + '] ' + msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+function badge(id, text, ok) {
+    var el = document.getElementById(id);
+    el.textContent = text;
+    el.style.borderColor = ok ? '#34a853' : '#ea4335';
+}
+
+function stopCurrentStream() {
+    if (currentStream) {
+        currentStream.getTracks().forEach(function (t) { t.stop(); });
+        currentStream = null;
+    }
+}
+
+async function refreshDevices() {
+    try {
+        var devices = await navigator.mediaDevices.enumerateDevices();
+        videoDevices = devices.filter(function (d) { return d.kind === 'videoinput'; });
+        log('enumerateDevices: ' + devices.length + ' device(s) total', 'info');
+        devices.forEach(function (d, i) {
+            log('  [' + i + '] kind=' + d.kind + ' label=' + (d.label || '(hidden)') +
+                ' id=' + (d.deviceId || '').substr(0, 24) + '...');
+        });
+        log('videoinput devices available for switching: ' + videoDevices.length, 'ok');
+        return devices;
+    } catch (e) {
+        log('enumerateDevices failed: ' + e, 'err');
+        return [];
+    }
+}
+
+async function testCamera(deviceId) {
+    stopCurrentStream();
+    var constraints = { audio: false, video: true };
+    if (deviceId) {
+        constraints.video = { deviceId: { exact: deviceId } };
+    }
+    log('getUserMedia(' + JSON.stringify(constraints) + ')');
+    try {
+        var stream = await navigator.mediaDevices.getUserMedia(constraints);
+        currentStream = stream;
+        preview.srcObject = stream;
+        var track = stream.getVideoTracks()[0];
+        var settings = track.getSettings ? track.getSettings() : {};
+        log('Camera OK: ' + track.label + ' (' + settings.width + 'x' + settings.height +
+            ' @ ' + settings.frameRate + 'fps)', 'ok');
+        await refreshDevices();
+    } catch (e) {
+        log('getUserMedia FAILED: ' + e.name + ' - ' + e.message, 'err');
+    }
+}
+
+async function switchCamera() {
+    if (videoDevices.length === 0) {
+        await refreshDevices();
+    }
+    // Prefer facingMode cycling: some WebViews expose only ONE videoinput
+    // device (labels hidden / merged front-back), so deviceId cycling can
+    // never switch cameras. facingMode('user' <-> 'environment') reliably
+    // toggles front/back on those devices too.
+    var currentFacing = null;
+    if (currentStream && currentStream.getVideoTracks().length > 0) {
+        var s = currentStream.getVideoTracks()[0].getSettings ? currentStream.getVideoTracks()[0].getSettings() : {};
+        currentFacing = s.facingMode || null;
+    }
+    var nextFacing = (currentFacing === 'environment') ? 'user' : 'environment';
+
+    var cams = videoDevices.filter(function (d) { return d.deviceId !== 'chromeclone-screen'; });
+    // If we have 2+ real cameras with distinct ids, use deviceId cycling
+    // (more precise). Otherwise fall back to facingMode toggle.
+    if (cams.length >= 2) {
+        currentDeviceIndex = (currentDeviceIndex + 1) % cams.length;
+        var dev = cams[currentDeviceIndex];
+        log('Switching to camera ' + (currentDeviceIndex + 1) + '/' + cams.length +
+            ': ' + (dev.label || dev.deviceId.substr(0, 16)), 'info');
+        await testCamera(dev.deviceId);
+        return;
+    }
+    if (cams.length === 0) {
+        log('No camera devices enumerated yet. Granting camera first...', 'info');
+        await testCamera();
+        return;
+    }
+    log('Only 1 camera listed by WebView — toggling facingMode to "' + nextFacing + '"', 'info');
+    stopCurrentStream();
+    try {
+        var stream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: { facingMode: { exact: nextFacing } }
+        });
+        currentStream = stream;
+        preview.srcObject = stream;
+        var track = stream.getVideoTracks()[0];
+        var settings = track.getSettings ? track.getSettings() : {};
+        log('Camera OK: ' + track.label + ' (' + settings.width + 'x' + settings.height +
+            ' @ ' + settings.frameRate + 'fps, facing=' + (settings.facingMode || '?') + ')', 'ok');
+        await refreshDevices();
+    } catch (e) {
+        log('facingMode switch FAILED: ' + e.name + ' - ' + e.message, 'err');
+        // Fall back to a plain getUserMedia (keeps whatever camera WebView picks).
+        await testCamera();
+    }
+}
+
+async function shareScreen() {
+    stopCurrentStream();
+    log('getDisplayMedia({video:true, audio:false}) via bridge...');
+    try {
+        var stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+        currentStream = stream;
+        preview.srcObject = stream;
+        var track = stream.getVideoTracks()[0];
+        log('Screen share OK, track: readyState=' + track.readyState, 'ok');
+        track.onended = function () { log('Screen track ended', 'info'); };
+    } catch (e) {
+        log('getDisplayMedia FAILED: ' + e.name + ' - ' + e.message, 'err');
+    }
+}
+
+function stopAll() {
+    stopCurrentStream();
+    preview.srcObject = null;
+    if (window.ChromeCloneNative && window.ChromeCloneNative.stopScreenCapture) {
+        try { window.ChromeCloneNative.stopScreenCapture(); } catch (e) {}
+    }
+    log('All streams stopped.', 'info');
+}
+
+// ---- boot diagnostics ----
+window.addEventListener('load', function () {
+    log('Test page loaded. ua=' + navigator.userAgent);
+    badge('badgeGUM', 'getUserMedia: ' + !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+          !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia));
+    var hasGdm = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+    badge('badgeGDM', 'getDisplayMedia: ' + hasGdm, hasGdm);
+    var bridged = !!(window.__chromeCloneBridge && window.__chromeCloneBridge.getDisplayMediaBridged);
+    badge('badgeBridge', 'bridge: ' + (bridged ? 'installed' : 'MISSING'), bridged);
+    log('ChromeClone bridge installed: ' + bridged +
+        ' (native interface: ' + (typeof window.ChromeCloneNative !== 'undefined') + ')',
+        bridged ? 'ok' : 'err');
+    refreshDevices();
+});
+
+document.getElementById('btnCamera').addEventListener('click', function () { testCamera(); });
+document.getElementById('btnSwitch').addEventListener('click', switchCamera);
+document.getElementById('btnEnum').addEventListener('click', refreshDevices);
+document.getElementById('btnShare').addEventListener('click', shareScreen);
+document.getElementById('btnStop').addEventListener('click', stopAll);
+</script>
+</body>
+</html>

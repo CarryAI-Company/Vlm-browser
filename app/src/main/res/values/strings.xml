@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ChromeClone</string>
+    <string name="url_hint">Search or type URL</string>
+    <string name="notification_channel_name">Screen Capture</string>
+    <string name="notification_channel_desc">Active screen capture session</string>
+    <string name="notification_text">ChromeClone is sharing your screen</string>
+    <string name="bookmarks_title">Bookmarks</string>
+    <string name="keep_alive_channel_name">Background running</string>
+    <string name="keep_alive_channel_desc">Keeps ChromeClone alive while in the background</string>
+    <string name="keep_alive_notification">ChromeClone is running in the background</string>
+</resources>

@@ -1,0 +1,27 @@
+# Gradle
+.gradle/
+build/
+app/build/
+local.properties
+
+# Android
+*.apk
+*.aab
+*.keystore
+*.jks
+!debug-key.jks
+captures/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
+
+# Chromium source (huge tarball, do not commit)
+chromium-src/
+
+# Emulator test artifacts
+*.png
