@@ -92,6 +92,29 @@ public class ScreenCaptureService extends Service {
     private volatile boolean firstFrameSeen = false;
     /** When the watchdog last rebuilt the display (rate-limit recoveries). */
     private volatile long lastRecoverAt = 0L;
+    /**
+     * Escalation state of the recovery ladder: 0 = surface-swap on next stall,
+     * 1 = escalate to a full VirtualDisplay rebuild on the next stall. Reset
+     * to 0 whenever a real frame arrives (the pipeline is healthy again).
+     *
+     * NOTE: rebuildVirtualDisplay() was removed because Android 14+ throws
+     * SecurityException ("Don't take multiple captures by invoking
+     * MediaProjection#createVirtualDisplay multiple times on the same
+     * instance") — releasing and recreating the VirtualDisplay on the same
+     * MediaProjection is ILLEGAL and kills the projection entirely. The only
+     * valid recovery is surface-swap on the existing VirtualDisplay
+     * (ScreenStream's approach for Google issue 370625489), so recoveryLevel
+     * is now kept only for diagnostics / future escalation strategies that do
+     * NOT recreate the VirtualDisplay.
+     */
+    private volatile int recoveryLevel = 0;
+    /**
+     * True while the Activity is in the foreground. The watchdog only fires
+     * when visible: in the background the system legitimately pauses the
+     * VirtualDisplay mirror (Android 14/15 behaviour), so firing the watchdog
+     * there just wastes recovery attempts and eats the rate-limit window.
+     */
+    private volatile boolean activityVisible = false;
     private int width;
     private int height;
     private int densityDpi;
@@ -109,30 +132,126 @@ public class ScreenCaptureService extends Service {
      */
     private static final long WATCHDOG_INTERVAL_MS = 2000L;
     private static final long STALL_THRESHOLD_MS = 3000L;
-    private static final long RECOVER_COOLDOWN_MS = 30000L; // 30s between recoveries
+    /**
+     * Minimum gap between recovery attempts — long enough for one attempt to
+     * start producing frames again, short enough to escalate quickly when it
+     * doesn't (the old flat 30s cooldown left the user staring at a black
+     * screen for half a minute when the first attempt failed).
+     */
+    private static final long RECOVER_MIN_GAP_MS = 4000L;
     private final Runnable captureWatchdog = new Runnable() {
         @Override
         public void run() {
             if (!capturing) return;
             long now = System.currentTimeMillis();
-            if (firstFrameSeen && now - lastFrameAt > STALL_THRESHOLD_MS
-                    && now - lastRecoverAt > RECOVER_COOLDOWN_MS) {
+            if (firstFrameSeen && activityVisible
+                    && now - lastFrameAt > STALL_THRESHOLD_MS
+                    && now - lastRecoverAt > RECOVER_MIN_GAP_MS) {
                 lastRecoverAt = now;
-                android.util.Log.w("ScreenCaptureService",
-                        "Watchdog: frames stalled for " + (now - lastFrameAt)
-                                + "ms, attempting surface-swap recovery");
-                showToast("Screen capture stalled — recovering…");
-                recoverCapture();
+                // Escalating recovery ladder (both rungs are legal on
+                // Android 14+: they never call createVirtualDisplay again,
+                // which would throw SecurityException and kill the whole
+                // projection). recoveryLevel resets to 0 when a SUSTAINED
+                // frame flow returns (see the onImageAvailable listeners).
+                //
+                // NOTE: the watchdog deliberately does NOT fire while the
+                // Activity is backgrounded — the system legitimately pauses
+                // the VirtualDisplay mirror there, and burning recovery
+                // attempts in the background wastes the rate-limit window.
+                // wakeIfStalled() (called from onResume) handles the
+                // background->foreground stall immediately instead.
+                if (recoveryLevel == 0) {
+                    recoveryLevel = 1;
+                    android.util.Log.w("ScreenCaptureService",
+                            "Watchdog: frames stalled for " + (now - lastFrameAt)
+                                    + "ms, attempting surface-swap recovery");
+                    showToast("Screen capture stalled — recovering…");
+                    recoverCapture();
+                } else {
+                    recoveryLevel = 1; // Stay at top rung; keep retrying it.
+                    android.util.Log.w("ScreenCaptureService",
+                            "Watchdog: still stalled after surface-swap ("
+                                    + (now - lastFrameAt)
+                                    + "ms), refreshing capture pipeline");
+                    showToast("Screen capture stalled — refreshing…");
+                    refreshCapturePipeline();
+                }
             }
             captureHandler.postDelayed(this, WATCHDOG_INTERVAL_MS);
         }
     };
 
     /**
+     * Builds the ImageReader.OnImageAvailableListener used by both the initial
+     * ImageReader and any replacement created during pipeline recovery. Pulled
+     * into a factory so recoverCapture/refreshCapturePipeline always wire the
+     * identical frame-handling logic.
+     */
+    private ImageReader.OnImageAvailableListener newFrameListener() {
+        return reader -> {
+            long now = System.currentTimeMillis();
+            if (now - lastFrameAt < FRAME_INTERVAL_MS) {
+                // Drain and drop the frame to keep the pipeline unblocked.
+                Image drop = reader.acquireLatestImage();
+                if (drop != null) drop.close();
+                return;
+            }
+            lastFrameAt = now;
+            // Only reset the recovery ladder on SUSTAINED healthy flow: a
+            // surface-swap/rebuild always pumps one token re-mirror frame
+            // immediately, which must NOT count as "recovered" — otherwise the
+            // watchdog would never escalate past surface-swap and the pipeline
+            // would loop "recovering…" forever without recovering (the exact
+            // symptom reported on the real device). A frame that arrives well
+            // after the last recovery attempt proves the pipeline really flows.
+            if (now - lastRecoverAt > STALL_THRESHOLD_MS) {
+                recoveryLevel = 0;
+            }
+            if (!firstFrameSeen) {
+                firstFrameSeen = true;
+                android.util.Log.i("ScreenCaptureService", "First frame captured");
+            }
+            Image image = reader.acquireLatestImage();
+            if (image == null) return;
+            try {
+                byte[] jpeg = imageToJpeg(image);
+                if (jpeg != null) {
+                    String dataUrl = Base64Utils.toJpegDataUrl(jpeg);
+                    pushFrameToJs(dataUrl);
+                    framesPushed++;
+                    if (framesPushed % 100 == 0) {
+                        android.util.Log.i("ScreenCaptureService",
+                                "capture alive: " + framesPushed + " frames pushed");
+                    }
+                } else {
+                    android.util.Log.w("ScreenCaptureService", "imageToJpeg returned null");
+                }
+            } catch (Throwable t) {
+                // Frame-level failures must never kill the service.
+                android.util.Log.e("ScreenCaptureService", "frame error", t);
+            } finally {
+                image.close();
+            }
+        };
+    }
+
+    /**
+     * Tracks whether the host Activity is currently resumed. The stall
+     * watchdog only acts while visible; in the background the system
+     * legitimately pauses the VirtualDisplay mirror (Android 14/15), so
+     * recovery there would just waste attempts. MainActivity calls this from
+     * onResume/onPause.
+     */
+    public void setActivityVisible(boolean visible) {
+        activityVisible = visible;
+    }
+
+    /**
      * Surface-swap recovery (ScreenStream's fix for Google issue 370625489):
      * detach the VirtualDisplay surface, resize to the same size (forces the
-     * display to re-mirror), re-attach, then push a fresh frame. Rate-limited
-     * by the watchdog's cooldown so it can't thrash.
+     * display to re-mirror), re-attach, then push a fresh frame. If this does
+     * not un-stall the pipeline, the watchdog escalates to
+     * {@link #refreshCapturePipeline()}.
      */
     private void recoverCapture() {
         captureHandler.post(() -> {
@@ -142,8 +261,12 @@ public class ScreenCaptureService extends Service {
                 virtualDisplay.setSurface(null);
                 virtualDisplay.resize(width, height, densityDpi);
                 virtualDisplay.setSurface(imageReader.getSurface());
-                lastFrameAt = System.currentTimeMillis();
-                framesPushed++;
+                // Deliberately NOT touching lastFrameAt here: the watchdog
+                // decides when to escalate based on how long it has been
+                // since a REAL frame arrived. Faking lastFrameAt would hide
+                // the stall and loop surface-swaps forever (exactly the
+                // "recovering… but never recovers" symptom). lastRecoverAt
+                // already rate-limits the attempts.
                 Image image = imageReader.acquireLatestImage();
                 if (image != null) {
                     try {
@@ -160,6 +283,44 @@ public class ScreenCaptureService extends Service {
                 android.util.Log.i("ScreenCaptureService", "Recovery surface-swap done");
             } catch (Throwable t) {
                 android.util.Log.e("ScreenCaptureService", "recoverCapture failed", t);
+            }
+        });
+    }
+
+    /**
+     * Second-rung recovery when a plain surface-swap did not un-stall the
+     * pipeline: rebuild the CONSUMER side only — a fresh ImageReader at the
+     * same size plus the null->resize->attach surface dance — while keeping
+     * the SAME VirtualDisplay instance. This is always legal on Android 14+
+     * (no second createVirtualDisplay call), unlike the old
+     * rebuildVirtualDisplay(), which threw SecurityException and killed the
+     * MediaProjection entirely.
+     */
+    private void refreshCapturePipeline() {
+        captureHandler.post(() -> {
+            if (!capturing || virtualDisplay == null || mediaProjection == null) return;
+            try {
+                notifyJs("window.__onScreenRecovering && window.__onScreenRecovering();");
+                final ImageReader newReader = ImageReader.newInstance(
+                        width, height, PixelFormat.RGBA_8888, 2);
+                newReader.setOnImageAvailableListener(
+                        newFrameListener(), captureHandler);
+                virtualDisplay.setSurface(null);
+                virtualDisplay.resize(width, height, densityDpi);
+                virtualDisplay.setSurface(newReader.getSurface());
+                ImageReader oldReader = imageReader;
+                imageReader = newReader;
+                if (oldReader != null) {
+                    try { oldReader.close(); } catch (Throwable ignored) {}
+                }
+                if (reusableBitmap != null) {
+                    reusableBitmap.recycle();
+                    reusableBitmap = null;
+                }
+                android.util.Log.i("ScreenCaptureService",
+                        "Recovery pipeline refresh done (fresh ImageReader)");
+            } catch (Throwable t) {
+                android.util.Log.e("ScreenCaptureService", "refreshCapturePipeline failed", t);
             }
         });
     }
@@ -246,6 +407,33 @@ public class ScreenCaptureService extends Service {
     }
 
     /**
+     * Proactive wake for activity resume: un-stalls the VirtualDisplay
+     * IMMEDIATELY when the pipeline is provably stalled, instead of waiting
+     * ~5s for the watchdog to notice.
+     *
+     * The three guards make this safe where the old onResume call to
+     * wakeUpVirtualDisplay() was not:
+     *   1. firstFrameSeen  — never touches a freshly-created display (the
+     *      permission-prompt onResume fires right after startCapture; a swap
+     *      there is exactly what caused the original black-from-start bug).
+     *   2. stalled         — a still-flowing pipeline needs no swap; touching
+     *      it risks a frame-drop hiccup for nothing.
+     *   3. rate limit      — reuses the watchdog's recovery timestamp so this
+     *      can't pile extra swaps on top of watchdog recoveries.
+     */
+    public void wakeIfStalled() {
+        if (!capturing || !firstFrameSeen) return;
+        long now = System.currentTimeMillis();
+        if (now - lastFrameAt <= STALL_THRESHOLD_MS) return; // Still healthy.
+        if (now - lastRecoverAt <= RECOVER_MIN_GAP_MS) return; // Recently handled.
+        lastRecoverAt = now;
+        android.util.Log.i("ScreenCaptureService",
+                "wakeIfStalled: pipeline stalled for " + (now - lastFrameAt)
+                        + "ms during background — waking on resume");
+        wakeUpVirtualDisplay();
+    }
+
+    /**
      * Re-checks the current display size and, if it changed, resizes the
      * capture pipeline. This mirrors ScreenStream's fix for Google issue
      * 370625489 ("After onCapturedContentResize + resize/surface swap, no
@@ -287,6 +475,12 @@ public class ScreenCaptureService extends Service {
                         return;
                     }
                     lastFrameAt = now;
+                    // Sustained-flow reset only (see the main listener's comment):
+                    // a token frame right after a recovery attempt must not
+                    // reset the escalation ladder.
+                    if (now - lastRecoverAt > STALL_THRESHOLD_MS) {
+                        recoveryLevel = 0;
+                    }
                     Image image = reader.acquireLatestImage();
                     if (image == null) return;
                     try {
@@ -447,41 +641,7 @@ public class ScreenCaptureService extends Service {
         mediaProjection.registerCallback(projectionCallback, captureHandler);
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
-        imageReader.setOnImageAvailableListener(reader -> {
-            long now = System.currentTimeMillis();
-            if (now - lastFrameAt < FRAME_INTERVAL_MS) {
-                // Drain and drop the frame to keep the pipeline unblocked.
-                Image drop = reader.acquireLatestImage();
-                if (drop != null) drop.close();
-                return;
-            }
-            lastFrameAt = now;
-            if (!firstFrameSeen) {
-                firstFrameSeen = true;
-                android.util.Log.i("ScreenCaptureService", "First frame captured");
-            }
-            Image image = reader.acquireLatestImage();
-            if (image == null) return;
-            try {
-                byte[] jpeg = imageToJpeg(image);
-                if (jpeg != null) {
-                    String dataUrl = Base64Utils.toJpegDataUrl(jpeg);
-                    pushFrameToJs(dataUrl);
-                    framesPushed++;
-                    if (framesPushed % 100 == 0) {
-                        android.util.Log.i("ScreenCaptureService",
-                                "capture alive: " + framesPushed + " frames pushed");
-                    }
-                } else {
-                    android.util.Log.w("ScreenCaptureService", "imageToJpeg returned null");
-                }
-            } catch (Throwable t) {
-                // Frame-level failures must never kill the service.
-                android.util.Log.e("ScreenCaptureService", "frame error", t);
-            } finally {
-                image.close();
-            }
-        }, captureHandler);
+        imageReader.setOnImageAvailableListener(newFrameListener(), captureHandler);
 
         virtualDisplay = mediaProjection.createVirtualDisplay(
                 "ChromeCloneScreenCapture",

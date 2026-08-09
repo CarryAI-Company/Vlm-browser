@@ -905,6 +905,12 @@ public class MainActivity extends AppCompatActivity {
         if (webView != null) {
             webView.onPause();
         }
+        // Background: the system legitimately pauses the VirtualDisplay
+        // mirror, so the capture watchdog must not treat that as a stall.
+        ScreenCaptureService svc = ScreenCaptureService.getInstance();
+        if (svc != null) {
+            svc.setActivityVisible(false);
+        }
         // Going to background: keep alive only if we're actively capturing.
         updateKeepAlive();
         super.onPause();
@@ -924,18 +930,24 @@ public class MainActivity extends AppCompatActivity {
         if (webView != null) {
             ScreenCaptureService svc = ScreenCaptureService.getInstance();
             if (svc != null) {
+                // Foreground again: re-arm the stall watchdog's visibility
+                // gate before anything else touches recovery state.
+                svc.setActivityVisible(true);
                 svc.attachWebView(webView);
                 if (svc.isCapturing()) {
                     android.util.Log.i("ChromeClone", "onResume: capture active, requesting frame");
-                    // NOTE: do NOT surface-swap here. wakeUpVirtualDisplay()
-                    // must not run right after capture starts — the prompt's
-                    // onResume fires immediately after startCapture and the
-                    // swap would break the freshly-created VirtualDisplay
-                    // (black from the very first frame). resizeIfNeeded() is
-                    // safe (no-op when size unchanged); requestFrame() pumps
-                    // one frame if the display is alive.
+                    // NOTE: do NOT surface-swap here unconditionally. A swap
+                    // right after capture starts breaks the freshly-created
+                    // VirtualDisplay (black from the very first frame — the
+                    // permission-prompt onResume fires immediately after
+                    // startCapture). resizeIfNeeded() is safe (no-op when the
+                    // size is unchanged); requestFrame() pumps one frame if
+                    // the display is alive; wakeIfStalled() performs the swap
+                    // ONLY when the pipeline is provably stalled AND has seen
+                    // at least one frame, so it can never hit startup.
                     svc.resizeIfNeeded();
                     svc.requestFrame();
+                    svc.wakeIfStalled();
                 } else {
                     android.util.Log.i("ChromeClone", "onResume: not capturing");
                 }
