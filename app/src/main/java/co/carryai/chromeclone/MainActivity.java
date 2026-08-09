@@ -69,6 +69,8 @@ public class MainActivity extends AppCompatActivity {
 
     private static final int REQ_RUNTIME_PERMISSIONS = 1001;
     private static final int REQ_MEDIA_PROJECTION = 1002;
+    /** MediaProjection consent re-requested by the capture-restart ladder. */
+    private static final int REQ_MEDIA_PROJECTION_RESTART = 1003;
 
     private static final String HOME_URL = "https://2026-pcf-demo.carryai.co/live-caption";
     private static final String TEST_URL = "file:///android_asset/test.html";
@@ -128,6 +130,12 @@ public class MainActivity extends AppCompatActivity {
 
     /** True while the page holds an active camera stream (reported by bridge.js). */
     private volatile boolean cameraActive = false;
+    /**
+     * True while a capture-restart consent prompt is showing. Lets
+     * onActivityResult tell a restart consent apart from a user-initiated
+     * Share Screen, so the right JS signal is sent if the user declines.
+     */
+    private volatile boolean restartInFlight = false;
 
     private String bridgeJs;
 
@@ -345,7 +353,37 @@ public class MainActivity extends AppCompatActivity {
         if (svc != null) {
             svc.attachWebView(webView);
         }
+        // The capture service escalates to a full restart (fresh MediaProjection
+        // consent) when the VirtualDisplay mirror dies and nothing else can
+        // revive it. Register how the Activity fulfils that request. The
+        // service is long-lived but this handler is re-registered in onResume
+        // too, so it always points at the current Activity/WebView.
+        if (svc != null) {
+            svc.setRestartHandler(restartHandler);
+        }
     }
+
+    /**
+     * Invoked (via the capture service's watchdog) when a stalled pipeline
+     * cannot be revived by surface-swap or a pipeline refresh and needs a
+     * brand-new MediaProjection session. Runs on the main thread.
+     */
+    private final ScreenCaptureService.RestartHandler restartHandler = () -> {
+        runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            android.util.Log.w("ChromeClone", "capture restart requested — re-showing consent");
+            MediaProjectionManager mpm =
+                    (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+            if (mpm == null) {
+                webView.evaluateJavascript(
+                        "window.__onScreenError && window.__onScreenError('Restart failed: MediaProjectionManager unavailable');",
+                        null);
+                return;
+            }
+            restartInFlight = true;
+            startActivityForResult(mpm.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION_RESTART);
+        });
+    };
 
     private void injectBridge(WebView view, String url) {
         if (bridgeJs == null || bridgeJs.isEmpty()) return;
@@ -770,7 +808,9 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQ_MEDIA_PROJECTION) {
+        if (requestCode == REQ_MEDIA_PROJECTION || requestCode == REQ_MEDIA_PROJECTION_RESTART) {
+            boolean isRestart = requestCode == REQ_MEDIA_PROJECTION_RESTART;
+            restartInFlight = false;
             if (resultCode == Activity.RESULT_OK && data != null) {
                 Intent start = new Intent(this, ScreenCaptureService.class);
                 start.setAction(ScreenCaptureService.ACTION_START);
@@ -780,12 +820,28 @@ public class MainActivity extends AppCompatActivity {
                 // Attach the WebView as soon as the service instance exists.
                 webView.postDelayed(() -> {
                     ScreenCaptureService svc = ScreenCaptureService.getInstance();
-                    if (svc != null) svc.attachWebView(webView);
+                    if (svc != null) {
+                        svc.attachWebView(webView);
+                        svc.setRestartHandler(restartHandler);
+                    }
                 }, 300);
             } else {
-                webView.evaluateJavascript(
-                        "window.__onScreenError && window.__onScreenError('Screen capture permission denied');",
-                        null);
+                // Consent declined. For a user-initiated Share Screen the page
+                // never had a stream, so __onScreenError is the right signal.
+                // For an automatic RESTART the page already holds a (dead)
+                // stream — sending __onScreenError would reject a pending
+                // getDisplayMedia that no longer exists; instead notify the
+                // shim that the restart was declined so it can surface a
+                // user-visible message and keep the page state consistent.
+                if (isRestart) {
+                    webView.evaluateJavascript(
+                            "window.__onScreenRestartDeclined && window.__onScreenRestartDeclined();",
+                            null);
+                } else {
+                    webView.evaluateJavascript(
+                            "window.__onScreenError && window.__onScreenError('Screen capture permission denied');",
+                            null);
+                }
             }
         }
     }
@@ -934,6 +990,10 @@ public class MainActivity extends AppCompatActivity {
                 // gate before anything else touches recovery state.
                 svc.setActivityVisible(true);
                 svc.attachWebView(webView);
+                // Keep the full-restart handler pointing at THIS Activity
+                // (it is a long-lived service; the handler must survive
+                // Activity recreation).
+                svc.setRestartHandler(restartHandler);
                 if (svc.isCapturing()) {
                     android.util.Log.i("ChromeClone", "onResume: capture active, requesting frame");
                     // NOTE: do NOT surface-swap here unconditionally. A swap
@@ -973,6 +1033,9 @@ public class MainActivity extends AppCompatActivity {
         ScreenCaptureService svc = ScreenCaptureService.getInstance();
         if (svc != null) {
             svc.detachWebView();
+            // Same for the restart handler: it captures `this`, so leaving it
+            // registered would pin a destroyed Activity.
+            svc.setRestartHandler(null);
         }
         if (webView != null) {
             webView.destroy();

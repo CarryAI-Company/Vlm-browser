@@ -442,6 +442,27 @@
         console.log('[ChromeClone] __onScreenRecovering');
     };
 
+    /**
+     * Called by native when the automatic capture-restart prompt was declined.
+     * The old pipeline is already torn down, so the screen stream is truly
+     * dead: stop its tracks and reset state (same as __onScreenEnded, but with
+     * a distinct log so diagnostics can tell the two apart).
+     */
+    window.__onScreenRestartDeclined = function () {
+        console.log('[ChromeClone] __onScreenRestartDeclined (frames=' + screenState.framesReceived + ')');
+        screenState.active = false;
+        if (screenState.stream) {
+            screenState.stream.getTracks().forEach(function (t) { t.stop(); });
+        }
+        screenState.stream = null;
+        if (screenState.pendingReject) {
+            var reject = screenState.pendingReject;
+            screenState.pendingResolve = null;
+            screenState.pendingReject = null;
+            reject(new DOMException('Screen capture restart declined', 'AbortError'));
+        }
+    };
+
     /** Called by native when the user denies the MediaProjection prompt or an error occurs. */
     window.__onScreenError = function (message) {
         console.log('[ChromeClone] __onScreenError: ' + message);
