@@ -456,6 +456,37 @@
     };
 
     /**
+     * Phase-2 native upload path: native sends captured frames straight to the
+     * VLM service and relays captions back here as plain text. Pages should
+     * listen for this callback and/or the 'chromeclone-caption' CustomEvent.
+     * (detail = { text, streamId, ts }). No frames ever cross the JS bridge,
+     * so this path is immune to the canvas black-screen failure mode.
+     */
+    window.__onCaption = function (text, streamId) {
+        if (!text) return;
+        try {
+            document.dispatchEvent(new CustomEvent('chromeclone-caption', {
+                detail: { text: text, streamId: streamId || '', ts: Date.now() }
+            }));
+        } catch (e) { /* CustomEvent unavailable: callback listeners still work */ }
+        var cbs = window.__chromeCloneCaptionListeners;
+        if (cbs) {
+            for (var i = 0; i < cbs.length; i++) {
+                try { cbs[i](text, streamId); } catch (e) { /* listener error */ }
+            }
+        }
+    };
+
+    /** Register an extra caption listener (for pages that prefer functions). */
+    window.__chromeCloneOnCaption = function (fn) {
+        if (typeof fn !== 'function') return;
+        if (!window.__chromeCloneCaptionListeners) {
+            window.__chromeCloneCaptionListeners = [];
+        }
+        window.__chromeCloneCaptionListeners.push(fn);
+    };
+
+    /**
      * Called by native when the automatic capture-restart prompt was declined.
      * The old pipeline is already torn down, so the screen stream is truly
      * dead: stop its tracks and reset state (same as __onScreenEnded, but with

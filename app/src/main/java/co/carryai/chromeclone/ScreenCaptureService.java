@@ -188,6 +188,25 @@ public class ScreenCaptureService extends Service {
     private int densityDpi;
     private Bitmap reusableBitmap;
 
+    // --------------------------------------------------------------
+    // Phase-2 native upload pipeline (bypasses the JS bridge entirely).
+    // --------------------------------------------------------------
+    /**
+     * Native frame uploader: sends JPEGs straight to the VLM service over
+     * WebSocket /ws/inference and receives captions. When enabled, frames
+     * never cross the JS bridge — eliminating the black-screen failure mode.
+     */
+    private FrameUploader frameUploader;
+    /**
+     * Crop region as fractions of the frame [x, y, w, h], or null for full
+     * frame. Set by MainActivity from CaptureConfig before capture starts /
+     * on settings change.
+     */
+    private volatile float[] cropFraction = null;
+
+    /** True while the native upload path is active (frames bypass the JS bridge). */
+    private volatile boolean uploadMode = false;
+
     public static ScreenCaptureService getInstance() {
         return sInstance.get();
     }
@@ -370,12 +389,12 @@ public class ScreenCaptureService extends Service {
             try {
                 byte[] jpeg = imageToJpeg(image);
                 if (jpeg != null) {
-                    String dataUrl = Base64Utils.toJpegDataUrl(jpeg);
-                    pushFrameToJs(dataUrl);
+                    deliverFrame(jpeg);
                     framesPushed++;
                     if (framesPushed % 100 == 0) {
                         android.util.Log.i("ScreenCaptureService",
-                                "capture alive: " + framesPushed + " frames pushed");
+                                "capture alive: " + framesPushed + " frames "
+                                        + (uploadMode ? "uploaded" : "pushed"));
                     }
                 } else {
                     android.util.Log.w("ScreenCaptureService", "imageToJpeg returned null");
@@ -426,7 +445,7 @@ public class ScreenCaptureService extends Service {
                     try {
                         byte[] jpeg = imageToJpeg(image);
                         if (jpeg != null) {
-                            pushFrameToJs(Base64Utils.toJpegDataUrl(jpeg));
+                            deliverFrame(jpeg);
                         }
                     } catch (Throwable t) {
                         android.util.Log.e("ScreenCaptureService", "recover frame error", t);
@@ -575,9 +594,10 @@ public class ScreenCaptureService extends Service {
             try {
                 byte[] jpeg = imageToJpeg(image);
                 if (jpeg != null) {
-                    pushFrameToJs(Base64Utils.toJpegDataUrl(jpeg));
+                    deliverFrame(jpeg);
                     android.util.Log.i("ScreenCaptureService",
-                            "requestFrame: pushed " + jpeg.length + " bytes");
+                            "requestFrame: " + (uploadMode ? "uploaded " : "pushed ")
+                                    + jpeg.length + " bytes");
                 } else {
                     android.util.Log.w("ScreenCaptureService", "requestFrame: jpeg was null");
                 }
@@ -673,35 +693,12 @@ public class ScreenCaptureService extends Service {
         captureHandler.post(() -> {
             try {
                 // Recreate ImageReader at the new size (like ScreenStream.resize).
+                // Reuse newFrameListener() so crop + native-upload routing stay
+                // identical to the primary pipeline (width/height are updated
+                // below before the first frame from the new reader is handled).
                 final ImageReader newReader = ImageReader.newInstance(
                         newW, newH, PixelFormat.RGBA_8888, 2);
-                newReader.setOnImageAvailableListener(reader -> {
-                    long now = System.currentTimeMillis();
-                    if (now - lastFrameAt < FRAME_INTERVAL_MS) {
-                        Image drop = reader.acquireLatestImage();
-                        if (drop != null) drop.close();
-                        return;
-                    }
-                    lastFrameAt = now;
-                    // Sustained-flow reset only (see the main listener's comment):
-                    // a token frame right after a recovery attempt must not
-                    // reset the escalation ladder.
-                    if (now - lastRecoverAt > STALL_THRESHOLD_MS) {
-                        recoveryLevel = 0;
-                    }
-                    Image image = reader.acquireLatestImage();
-                    if (image == null) return;
-                    try {
-                        byte[] jpeg = imageToJpeg(image, newW, newH);
-                        if (jpeg != null) {
-                            pushFrameToJs(Base64Utils.toJpegDataUrl(jpeg));
-                        }
-                    } catch (Throwable t) {
-                        android.util.Log.e("ScreenCaptureService", "frame error", t);
-                    } finally {
-                        image.close();
-                    }
-                }, captureHandler);
+                newReader.setOnImageAvailableListener(newFrameListener(), captureHandler);
 
                 // Issue 370625489 workaround: null surface -> resize -> new surface.
                 virtualDisplay.setSurface(null);
@@ -899,7 +896,28 @@ public class ScreenCaptureService extends Service {
         reusableBitmap.copyPixelsFromBuffer(buffer);
         full = Bitmap.createBitmap(reusableBitmap, 0, 0, w, h);
 
-        // Downscale to keep the JS bridge fast.
+        // Optional crop: cut out the selected region (fractions of the frame)
+        // BEFORE downscaling, so the VLM only ever sees the region of interest.
+        // copy() gives us an owned bitmap, so the later full.recycle() is safe
+        // regardless of whether the source was the reusable buffer view.
+        float[] crop = cropFraction;
+        if (crop != null) {
+            int cx = clampPx(Math.round(crop[0] * w), w);
+            int cy = clampPx(Math.round(crop[1] * h), h);
+            int cw = clampPx(Math.round(crop[2] * w), w);
+            int ch = clampPx(Math.round(crop[3] * h), h);
+            if (cx + cw > w) cw = w - cx; // keep inside the frame
+            if (cy + ch > h) ch = h - cy;
+            if (cw >= 8 && ch >= 8) { // ignore degenerate selections
+                Bitmap region = Bitmap.createBitmap(full, cx, cy, cw, ch);
+                Bitmap owned = region.copy(Bitmap.Config.ARGB_8888, false);
+                full = (owned != null) ? owned : region;
+                w = cw;
+                h = ch;
+            }
+        }
+
+        // Downscale to keep uploads (and the legacy JS bridge) fast.
         int targetW = w;
         int targetH = h;
         int maxDim = Math.max(w, h);
@@ -917,6 +935,71 @@ public class ScreenCaptureService extends Service {
         return out.toByteArray();
     }
 
+    /** Clamps a pixel coordinate into [0, max-1]. */
+    private static int clampPx(int v, int max) {
+        return Math.max(0, Math.min(max - 1, v));
+    }
+
+    // ------------------------------------------------------------------
+    // Phase-2 native upload wiring
+    // ------------------------------------------------------------------
+
+    /**
+     * Enables/disables the native upload path. When enabled, captured frames
+     * are sent straight to the VLM service over WebSocket and are NOT pushed
+     * through the JS bridge (which is what causes the black-screen mode).
+     * Captions come back and are relayed to the page as tiny text.
+     */
+    public void setUploadMode(boolean enabled, CaptureConfig cfg) {
+        if (enabled) {
+            // Apply the configured crop (fractions), or null for full frame.
+            if (cfg != null && cfg.hasCrop()) {
+                cropFraction = new float[]{
+                        cfg.getCropX(), cfg.getCropY(), cfg.getCropW(), cfg.getCropH()};
+            } else {
+                cropFraction = null;
+            }
+            if (frameUploader == null) {
+                frameUploader = new FrameUploader(new FrameUploader.Listener() {
+                    @Override
+                    public void onCaption(String text, String sid) {
+                        // Relay the caption to the page (small text = safe).
+                        notifyJs("window.__onCaption && window.__onCaption("
+                                + jsString(text) + "," + jsString(sid) + ");");
+                    }
+                    @Override
+                    public void onStateChanged(FrameUploader.State s) {
+                        android.util.Log.i("ScreenCaptureService", "uploader state: " + s);
+                    }
+                });
+            }
+            String ws = CaptureConfig.toWsInferenceUrl(cfg.getServerUrl());
+            frameUploader.start(ws, cfg.getInstruction(), cfg.getSystemPrompt(),
+                    cfg.getStreamId(), cfg.getMinIntervalMs());
+        } else {
+            cropFraction = null;
+            if (frameUploader != null) frameUploader.stop();
+        }
+        uploadMode = enabled;
+    }
+
+    /** JS-escapes a value into a quoted string literal for evaluateJavascript. */
+    private static String jsString(String s) {
+        if (s == null) return "''";
+        StringBuilder sb = new StringBuilder("'");
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\': sb.append("\\\\"); break;
+                case '\'': sb.append("\\'"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                default: sb.append(c);
+            }
+        }
+        return sb.append("'").toString();
+    }
+
     private void pushFrameToJs(String dataUrl) {
         // Escape single quotes defensively (base64 never contains them, but be safe).
         String js = "window.__onScreenFrame && window.__onScreenFrame('" + dataUrl + "');";
@@ -925,6 +1008,19 @@ public class ScreenCaptureService extends Service {
         // bridge is dead even though capture looks healthy.
         framesSinceAck++;
         notifyJs(js);
+    }
+
+    /**
+     * Single routing point for a finished JPEG: upload mode sends it straight
+     * to the VLM service (no JS bridge), legacy mode pushes it through the
+     * JS bridge for the canvas/captureStream path.
+     */
+    private void deliverFrame(byte[] jpeg) {
+        if (uploadMode && frameUploader != null) {
+            frameUploader.submitFrame(jpeg);
+        } else {
+            pushFrameToJs(Base64Utils.toJpegDataUrl(jpeg));
+        }
     }
 
     /**
@@ -1065,6 +1161,10 @@ public class ScreenCaptureService extends Service {
     @Override
     public void onDestroy() {
         stopCapture();
+        if (frameUploader != null) {
+            frameUploader.destroy();
+            frameUploader = null;
+        }
         if (captureThread != null) {
             captureThread.quitSafely();
             captureThread = null;

@@ -511,6 +511,11 @@ public class MainActivity extends AppCompatActivity {
             return true;
         });
         btnSwitchCamera.setOnClickListener(v -> switchCameraFromUi());
+        // Long-press Switch Camera = capture/upload settings (Phase 2).
+        btnSwitchCamera.setOnLongClickListener(v -> {
+            showCaptureSettingsDialog();
+            return true;
+        });
         updateNavButtons();
     }
 
@@ -834,6 +839,87 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    // ------------------------------------------------------------------
+    // Phase 2: native upload mode + settings
+    // ------------------------------------------------------------------
+
+    /** Lazily-created capture/upload settings (server URL, crop, interval...). */
+    private CaptureConfig captureConfig;
+
+    private CaptureConfig config() {
+        if (captureConfig == null) captureConfig = new CaptureConfig(this);
+        return captureConfig;
+    }
+
+    /**
+     * Applies the configured native-upload mode to a running capture service.
+     * When upload is enabled, frames bypass the JS bridge entirely (no canvas,
+     * no black-screen failure mode); captions come back as text.
+     */
+    private void applyUploadMode(ScreenCaptureService svc) {
+        CaptureConfig cfg = config();
+        svc.setUploadMode(cfg.isUploadEnabled(), cfg);
+    }
+
+    /** Settings dialog: upload mode, server URL, instruction, interval, crop. */
+    private void showCaptureSettingsDialog() {
+        final CaptureConfig cfg = config();
+        final EditText urlInput = new EditText(this);
+        urlInput.setText(cfg.getServerUrl());
+        urlInput.setHint("ws://host:port or http://host:port");
+        final EditText instrInput = new EditText(this);
+        instrInput.setText(cfg.getInstruction());
+        instrInput.setMinLines(2);
+        final EditText intervalInput = new EditText(this);
+        intervalInput.setText(String.valueOf(cfg.getMinIntervalMs()));
+        intervalInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        final android.widget.CheckBox uploadToggle = new android.widget.CheckBox(this);
+        uploadToggle.setText("Native upload to VLM service (no JS bridge)");
+        uploadToggle.setChecked(cfg.isUploadEnabled());
+
+        android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
+        layout.setOrientation(android.widget.LinearLayout.VERTICAL);
+        int pad = (int) (16 * getResources().getDisplayMetrics().density);
+        layout.setPadding(pad, pad / 2, pad, 0);
+        layout.addView(new android.widget.TextView(this));
+        layout.addView(uploadToggle);
+        layout.addView(new android.widget.TextView(this));
+        layout.addView(urlInput);
+        layout.addView(new android.widget.TextView(this));
+        layout.addView(instrInput);
+        layout.addView(new android.widget.TextView(this));
+        layout.addView(intervalInput);
+
+        new AlertDialog.Builder(this)
+                .setTitle("Capture / upload settings")
+                .setView(layout)
+                .setPositiveButton("Save", (d, w) -> {
+                    cfg.setUploadEnabled(uploadToggle.isChecked());
+                    cfg.setServerUrl(urlInput.getText().toString().trim());
+                    cfg.setInstruction(instrInput.getText().toString().trim());
+                    try {
+                        cfg.setMinIntervalMs(Long.parseLong(
+                                intervalInput.getText().toString().trim()));
+                    } catch (NumberFormatException ignored) { /* keep old */ }
+                    // Apply to a running capture immediately.
+                    ScreenCaptureService svc = ScreenCaptureService.getInstance();
+                    if (svc != null) applyUploadMode(svc);
+                    Toast.makeText(this, cfg.isUploadEnabled()
+                            ? "Upload ON → " + cfg.getServerUrl()
+                            : "Upload OFF (legacy JS bridge)", Toast.LENGTH_SHORT).show();
+                })
+                .setNeutralButton(cfg.hasCrop() ? "Clear crop" : "No crop set", (d, w) -> {
+                    if (cfg.hasCrop()) {
+                        cfg.clearCrop();
+                        Toast.makeText(this, "Crop cleared", Toast.LENGTH_SHORT).show();
+                        ScreenCaptureService svc = ScreenCaptureService.getInstance();
+                        if (svc != null) applyUploadMode(svc);
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
@@ -852,6 +938,10 @@ public class MainActivity extends AppCompatActivity {
                     if (svc != null) {
                         svc.attachWebView(webView);
                         svc.setRestartHandler(restartHandler);
+                        // Phase 2: apply the native-upload mode (frames go
+                        // straight to the VLM service; captions come back as
+                        // text). No-op when upload is disabled in settings.
+                        applyUploadMode(svc);
                     }
                 }, 300);
             } else {

@@ -73,6 +73,8 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.7.0'
     // WebViewCompat.addDocumentStartJavaScript for pre-parse bridge injection.
     implementation 'androidx.webkit:webkit:1.12.1'
+    // WebSocket client for the native frame uploader (/ws/inference).
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
 
     testImplementation 'junit:junit:4.13.2'
     // Real org.json for JVM unit tests (the Android stub throws "not mocked").
