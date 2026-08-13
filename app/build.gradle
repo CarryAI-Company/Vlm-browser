@@ -26,11 +26,16 @@ android {
             //     -alias chromeclone -keyalg RSA -keysize 2048 -validity 10000 \
             //     -storepass chromeclone123 -keypass chromeclone123 \
             //     -dname "CN=ChromeClone, OU=CarryAI, O=CarryAI, L=HK, S=HK, C=HK"
-            // The password is dev-only and already lives in this file.
+            //
+            // SECURITY: passwords are read from local.properties (gitignored),
+            // never committed to source control. Add these lines to
+            // local.properties (or supply via -P on the command line):
+            //   CHROMECLONE_STORE_PASSWORD=chromeclone123
+            //   CHROMECLONE_KEY_PASSWORD=chromeclone123
             storeFile file("chromeclone.keystore")
-            storePassword "chromeclone123"
+            storePassword project.findProperty('CHROMECLONE_STORE_PASSWORD') ?: ''
             keyAlias "chromeclone"
-            keyPassword "chromeclone123"
+            keyPassword project.findProperty('CHROMECLONE_KEY_PASSWORD') ?: ''
         }
     }
 
