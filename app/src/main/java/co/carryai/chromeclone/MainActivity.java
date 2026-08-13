@@ -230,6 +230,11 @@ public class MainActivity extends AppCompatActivity {
         s.setDisplayZoomControls(false);
         s.setAllowFileAccess(true);
         s.setAllowContentAccess(true);
+        // SECURITY: prevent file:// pages from accessing other local files or
+        // cross-origin resources. Deprecated in API 30 (default false) but
+        // minSdk is 26, so set explicitly for older devices.
+        s.setAllowFileAccessFromFileURLs(false);
+        s.setAllowUniversalAccessFromFileURLs(false);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             s.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         }
